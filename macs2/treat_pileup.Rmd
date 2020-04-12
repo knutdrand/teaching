@@ -15,12 +15,12 @@ print(open("data/test.bed").read())
 ```
 
 The information we need here are contained in columns 1, 2, 3 and 6, which are the chromosome, leftmost and rightmost position on the chromosome and the strand of the read, respectively.
-We need the direction in order to determine which direction the read should be extended. A simple parser can be something like this:
+We need the strand in order to determine which direction the read should be extended. A simple parser can be something like this:
 
 ```{python}
 def parse_bed_line(line):
-    chrom, start, end, _, _, strand = line.split(None, 6)[:6]
-    return (chrom, int(start), int(end), strand)
+    _, start, end, _, _, strand = line.split(None, 6)[:6]
+    return (int(start), int(end), strand)
 ```
 
 With this parser, we can get each read in the bed file by a simple generator:
@@ -32,13 +32,12 @@ In order to get the estimated fragment from a read, we need to extend it to matc
 
 ```{python}
 def extend_read(read, fragment_length):
-    chrom, start, end, strand = read
+    start, end, strand = read
     start = start if strand=="+" else end-fragment_length
     end = end if strand=="-" else start+fragment_length
-    return chrom, start, end
+    return start, end
 
-fragments = [extend_read(read, 296) for read in reads]
-
+fragments = [extend_read(read, 100) for read in reads]
 ```
 Now the most extensive operation remains: We need to count the number of fragments overlapping each position in the chromosome. The most simple and naive way is to create a count array the size of the chromsome, and simply increment the count for each position covered by a fragment. This might looks something like this:
 
@@ -47,38 +46,53 @@ import numpy as np
 import matplotlib.pyplot as plt
 def get_pileup(fragments, chromosome_size):
     counts = np.zeros(chromosome_size, dtype="int")
-    for chrom, start, end in fragments:
+    for start, end in fragments:
         counts[max(start, 0):min(end, chromosome_size)] += 1
     return counts
 plt.plot(get_pileup(fragments, 500))
 ```
-Of course, when dealing with millions of reads and billions of basepairs, this is not a viable solution. A slightly faster version, that takes us closer to what macs does, is to only tally the starts and ends of each fragment, and create the pileup in the end:
+Of course, when dealing with millions of reads and billions of basepairs, this is not a viable solution. A slightly faster version, that takes us closer to what MACS does, is to only tally the starts and ends of each fragment, and create the pileup in the end:
 
 ```{python}
 def get_pileup(fragments, chromosome_size):
     diffs = np.zeros(chromosome_size+1, dtype="int")
-    for chrom, start, end in fragments:
+    for start, end in fragments:
         diffs[max(start, 0)]+=1
         diffs[min(end, chromosome_size)] -= 1
     return np.cumsum(diffs)[:-1]
 plt.plot(get_pileup(fragments, 500))
 ```
-Of course, this still needs to store a value and perform an addition for each basepair in the chromosome, and thus still have higher complexity than needed.
+Of course, this still needs to store a value and perform an addition for each position in the chromosome, and thus still have higher complexity than needed.
 
 The solution macs employs is to only store count at each change point, i.e the start or end of a fragment.
 
 ```{python}
-from itertools import chain
-def get_sparse_pileup(fragments):
-    index_diff_pairs = chain(*([(start, 1), (end, -1)] for _, start, end in fragments))
-    indexes, diffs = zip(*sorted(index_diff_pairs))
-    return indexes, np.cumsum(diffs)
-plt.xlim(0, 500)
-treat_pileup = get_sparse_pileup(fragments)
-plt.step(*treat_pileup, where="post")
+from itertools import chain, accumulate
+def get_step_function(fragments):
+    steps = chain(*(((start, 1), (end, -1)) for start, end in fragments))
+    return accumulate(sorted(steps), lambda x, y: (y[0], x[1]+y[1]))
+
+steps = get_step_function(fragments)
+```
+We can sych functions by using the `step` function in `pyplot`:
+```{python}
+def plot_step_function(steps, chrom_size=20000):
+    plt.xlim(0, chrom_size)
+    return plt.step(*zip(*steps),  where="post")
+
+plot_step_function(steps, 500)
 ```
 
 This solution removes the G complexity (exemplified by not accepting chromsome_size as parameter). But introduces the need to sort the start and endpoints of the fragments, thus getting complexity "N*log(N)"
+
+Now we have the machinery to create the step function for the IP'ed treatment.
+```{python}
+fragment_length=100
+genome_size=20000
+treat_reads = [parse_bed_line(line) for line in open("data/treat.bed")]
+n_treat_reads = len(treat_reads)
+treat_pileup = list(get_step_function(extend_read(read, fragment_length) for read in treat_reads))
+```
 
 ## Control Lambda
 The second step is to estimate how many fragments you would expect to overlap each position.
@@ -87,93 +101,109 @@ The way MACS does this is by creating a pileup where each read adds one count to
 
 ```{python}
 def expand_to_window_size(read, window_size):
-    chrom, start, end, strand = read
+    start, end, strand = read
     midpoint = start if strand=="+" else end
-    return chrom, midpoint-window_size//2, midpoint+window_size//2
-input_reads = (parse_bed_line(line) for line in open("data/test.bed"))
-window_size = 500
-covered_areas = (expand_to_window_size(read, window_size) for read in input_reads)
+    return (midpoint-window_size//2, midpoint+window_size//2)
 ```
 In order to get the counts for each basepair, we construct a sparse pileup. And then divide the counts by the window size to get the local averages:
 ```{python}
-indexes, counts = get_sparse_pileup(covered_areas)
-averages = counts/window_size
+def apply_func(steps, func):
+    return [(i, func(v)) for i, v in steps]
 
-plt.xlim(0, 500);plt.step(indexes, averages, where="post")
-```
-From this we have gotten the local averages for a window size of 500, represented with a sprarse pileup. In order to be conservative, MACS calculates the local averages with window sizes corresponding to the framgment size, 1000bp, 10000bp and the genome size. It then uses the maximum of these averages for each basepair as the lambda.
-
-In order to do this we need code that calculates the element wise maximum of a sparse pileup.
-Lets formalize the sparse pileup type first:
-
-```{python}
-from collections import namedtuple
-SparsePileup = namedtuple("SparsePileup", ["Indexes", "Values"])
-```
-and create a function that calculates the local average pileup given reads and a `window_size`:
-```{python}
 def get_local_average(reads, window_size):
     covered_areas = (expand_to_window_size(read, window_size) for read in reads)
-    indexes, counts = get_sparse_pileup(covered_areas)
-    return SparsePileup(indexes, counts/window_size)
+    steps = get_step_function(covered_areas)
+    return apply_func(steps, lambda v: v/window_size)
 ```
-Now lets get to the actual elementwise maximim calculation. This is maybe one of the trickiest parts becuase it invloves doing a binary operator on these sparse-pileups. Since the indexes in the two SparesPileups might be different, you cannot compare the values directly. The solution that MACS uses here is to modify the SparsePileups such that the their indexes are the same. 
-In order to sync the indexes in a reasonably efficient matter, we're gonna use `heapq.merge`, which can take the indexes from each sparse pileup, and return them in sorted order. This is not pretty code, but this is also the most difficult part of the code.
-
+We can do this for the input reads for a window size of 500. 
+```{python}
+input_reads = [parse_bed_line(line) for line in open("data/input.bed")]
+n_input_reads = len(input_reads)
+local_average = get_local_average(input_reads, 500)
+plot_step_function(local_average)
+```
+From this we have gotten the local averages for a window size of 500, represented by a step function. In order to be conservative, MACS calculates the local averages with window sizes corresponding to the framgment size, 1000bp, 10000bp and the genome size. It then uses the maximum of these averages for each basepair as the lambda.
+```{python}
+local_averages = [get_local_average(input_reads, w) for w in (100, 1000, 10000)] + [[(0, n_input_reads/genome_size), (genome_size, n_input_reads/genome_size)]]
+[plot_step_function(sp) for sp in local_averages];plt.show()
+```
+Calculating the maximum is easy conceptually, but the most tricky part programatically. Since the indexes in the step function can be different, we can't compare the values directly. Therefore we need to make sure that each step function has an entry for every index used by one of the step functions. The syncing of the indexes can be done like this:
 ```{python}
 import heapq
-from itertools import groupby
 from operator import setitem, itemgetter
-def apply_func(sparse_pileups, func): 
-     cur_values = [0 for _ in sparse_pileups] 
-     updated_values = lambda vps: [setitem(cur_values, p, v) for _, v, p in vps] and cur_values 
-     key_values = lambda p, sp: ((i, v, p) for (i, v) in zip(*sp)) 
-     all_key_values = [key_values(*pair) for pair  in enumerate(sparse_pileups)] 
-     index_newvalue_pairs = [(i, func(*updated_values(vps))) for i, vps in groupby(heapq.merge(*all_key_values), key=itemgetter(0))] 
-     return SparsePileup(*zip(*index_newvalue_pairs))
-reads = [parse_bed_line(line) for line in open("data/test.bed")]
-sparse_pileups = [get_local_average(reads, w) for w in (100, 200)]
-[plt.step(*sp, where="post") for sp in sparse_pileups]; plt.xlim(0, 500);plt.show()
-control_lambda = apply_func(sparse_pileups, max)
-plt.xlim(0, 500);plt.step(*control_lambda, where="post")
+from itertools import groupby
+def uniq_indexes(pileup):
+    return (last_value for index, (*_, last_value) in groupby(pileup, itemgetter(0)))
+
+def sync_indexes(pileups):
+    cur_values = [0 for _ in pileups]
+    updated_values = lambda j, v: setitem(cur_values, j, v) or cur_values
+    all_steps = ([(step, j) for step in steps]  for j, steps in enumerate(pileups))
+    steps = ((i, updated_values(j, v)) for (i, v), j in heapq.merge(*all_steps))
+    return uniq_indexes(steps)
+```
+Implementation notes: The main point here is to merge the entries in each of the step functions, then iterate thorouh these entries and update the current values. Since two step functions can share an index, we need to clean up the indexes afterwords, only keeping the last entry for each index.
+
+After this syncing is done we can use the apply_func function from earlier:
+```{python}
+control_lambda = apply_func(sync_indexes(local_averages), max)
+plot_step_function(control_lambda)
 ```
 
+The last step for the control track is to convert it from average input reads, to expected coverage by treatment fragments. In order to do this we scale it with the ratio of input reads vs treatment reads, and multiply by the fragment length.
+```{python}
+scale_factor = len(treat_reads)/len(input_reads)*fragment_length
+scaled_lambda = apply_func(control_lambda, lambda v: v*scale_factor)
+plot_step_function(scaled_lambda);plot_step_function(treat_pileup)
+```
 ## Getting the P-values
 Now we have two tracks, the treatment pileup, representing the estimated number of fragments covering each basepair, and the control lambda, representing the expected number of fragments if the region is background. The next step is then to calculate a p value for each position.
 
 ```{python}
 from scipy.stats import poisson
-get_p_score = lambda count, l: -poisson.logsf(count, l)/np.log(10)
-log_p = apply_func((treat_pileup, control_lambda), get_p_score)
-plt.xlim(0, 500);plt.step(*log_p, where="post")
+import math
+get_p_score = lambda pair: -poisson.logsf(pair[0]-1, pair[1])/math.log(10)
+log_p = apply_func(sync_indexes((treat_pileup, scaled_lambda)), get_p_score)
+plot_step_function(log_p)
 ```
 In the simplest case, the p-scores are used to deduce peaks.
-
 ```{python}
-def get_peaks(scores, threshold=2):
-    value_grouped = groupby(zip(*scores), lambda pair: pair[1]>-np.log10(threshold))
-    indexes, values = zip(*((next(pairs)[0],v) for v, pairs in value_grouped))
-    return indexes, values
-npeaks = get_peaks(log_p, 0.0000001)
-plt.xlim(0, 500);plt.step(*peaks, where="post")
+from itertools import dropwhile
+def uniq_values(pileup):
+    return (next(group) for _, group in groupby(pileup, itemgetter(1)))
+
+def get_peaks(scores, threshold=0.05):
+    thresholded = apply_func(scores, lambda v: v>-math.log(threshold, 10))
+    cleaned = dropwhile(lambda iv: not iv[1], uniq_values(thresholded))
+    return [i for i, v in cleaned]
+peaks = get_peaks(log_p, 0.001)
+
+def paired(iterator):
+    return zip(*([iter(iterator)]*2))
+
+def plot_peaks(peaks, y=-1):
+    for start, end in peaks:
+        plt.hlines(y, start, end)
+plot_peaks(paired(peaks))
 ```
 Only two steps remianing now, filling in small holes between peaks, and removing small peaks.
 Filling small holes is just joining
 
 ```{python}
-def pairwise(iterable):
-    "s -> (s0,s1), (s1,s2), (s2, s3), ..."
-    a, b = tee(iterable)
-    next(b, None)
-    return zip(a, b)
+def merge_peaks(peaks, max_gap=10):
+    holes = paired(peaks[1:-1])
+    filtered_holes = chain(*((end, start) for end, start in holes if start-end>=max_gap))
+    return list(chain(peaks[:1], filtered_holes, peaks[-1:]))
 
-def merge_peaks(peaks, max_gap):
-    return SparsePileup(*zip(*((i, v) for (i, v), (j, _) in pairwise(zip(*peaks)) if not(j-i<=max_gap and v))))
-
-def remove_small_peaks(pekas, min_size):
-    return SparsePileup(*zip(*((i, v) for (i, v), (j, _) in pairwise(zip(*peaks)) if not(j-i<=max_gap and v)))
-
+def remove_small_peaks(peaks, min_size=100):
+    return [(start, end) for start, end in paired(peaks) if end-start>=min_size]
+merged_peaks = merge_peaks(peaks)
+plot_peaks(paired(merged_peaks), -2)
+final = remove_small_peaks(merged_peaks)
+plot_peaks(final, -3)
+plt.show()
 ```
+
 
 
 
