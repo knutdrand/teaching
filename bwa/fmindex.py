@@ -22,9 +22,8 @@ def get_occ(bwt):
     return {c: count(c) for c in "AGCT"}
 
 def get_C(sequence):
-    counts = accumulate(sum(e==c for e in sequence) for c in sorted("AGCT"))
-    print("HEI")
-    return dict(zip(sorted("AGCT"), chain([1], (c+2 for c in counts))))
+    counts = accumulate(sum(e==c for e in sequence) for c in sorted("$AGCT"))
+    return dict(zip(sorted("AGCT"), counts))
 
 def lr_map(occ, C, interval, char):
     return  (C[char] + occ[char][interval[0]],
