@@ -19,26 +19,36 @@ class BiInterval:
     length: int
 
 @dataclass
-class EM:
+class ExactMatch:
     start: int
     end: int
     bint: BiInterval
 
-def lr_map(occ, C, bint, char):
-    bint = BiInterval(0, 0, len(occ["A"])-1) if bint is None else bint
-    new_start = C[char] + occ[char][bint.start]
-    new_length = occ[char][bint.start+bint.length]-occ[char][bint.start]
-    counts=[occ[c][bint.start+bint.length]-occ[c][bint.start] for c in "ACGT".translate(compliments)]
-    new_r_start = bint.r_start+bint.length-sum(counts["ACGT".find(char.translate(compliments)):])
-    return replace(bint, start=new_start, r_start=new_r_start, length=new_length)
+def count_occurances(occ, char, length, start=0):
+    return occ[char][start+length]-occ[char][start]
 
-def forward(lr, bint, c):
-    r_bint = BiInterval(bint.r_start, bint.start, bint.length)
-    new_bint = lr(r_bint, c.translate(compliments))
-    return BiInterval(new_bint.r_start, new_bint.start, new_bint.length)
+def get_LF_map(fm):
+    N = len(fm.occ["A"])-1
+    def count_occ(char, length, start=0):
+        return fm.occ[char][start+length]-fm.occ[char][start]
 
-def _backward_search(lr, em, c):
-    return replace(em, start=em.start-1, bint=lr(em.bint, c))
+    def LF_map(bint, char):
+        bint = BiInterval(0, 0, N) if bint is None else bint
+        new_start = fm.C[char] + count_occ(char, bint.start)
+        new_length = count_occ(char, bint.length, bint.start)
+        counts=[count_occ(c, bint.length, bint.start) for c in "ACGT".translate(compliments)]
+        new_r_start = bint.r_start+bint.length-sum(counts["ACGT".find(char.translate(compliments)):])
+        return replace(bint, start=new_start, r_start=new_r_start, length=new_length)
+
+    return LF_map
+
+def forward_extend(backward_extend, bint, c):
+    r_bint = replace(bint, start=bint.r_start, r_start=bint.start)
+    new_bint = backward_extend(r_bint, c.translate(compliments))
+    return replace(new_bint, start=new_bint.r_start, r_start=new_bint.start)
+
+def _backward_search(LF, em, c):
+    return replace(em, start=em.start-1, bint=LF(em.bint, c))
 
 def _forward_search(forward_extend, em, c):
     return replace(em, end=em.end+1, bint=forward_extend(em.bint, c))
@@ -60,77 +70,75 @@ def plot_bint(lines, bint, L):
     plt.show()
 
 def unique_lastseen(iterable, key=None):
-    return (last for _, (*_, last) in groupby(iterable, key))
-
-def _find_smem_candidates(backward_extend, query, position):
-    init_bint = backward_extend(None, query[position])
-    bints = accumulate(reversed(query[:position]), backward_extend, initial=init_bint)
-    bints = takewhile(lambda bint: bint.length, bints)
-    candidates = unique_lastseen(enumerate(bints), lambda cand: cand[1].length)
-    return list(candidates)
+    return (last for *_, last in map(itemgetter(1), groupby(iterable, key)))
 
 def find_smem_candidates(backward_search, query, position):
-    init_em = backward_search(EM(position+1, position+1, None), query[position])
+    init_em = backward_search(ExactMatch(position+1, position+1, None), query[position])
     ems = accumulate(reversed(query[:position]), backward_search, initial=init_em)
     ems = takewhile(lambda em: em.bint.length, ems)
     return list(unique_lastseen(ems, lambda em: em.bint.length))
 
-def _finalize_smem_candidates(forward_extend, query, position, candidates):
-    def filter_candidates(candidates, c):
-        print(candidates)
-        extended = ((j, forward_extend(bint, c)) for (j, bint) in candidates)
-        return [(j, bint) for j, bint in extended if bint.length]
-    candidates = list(reversed(candidates))
-    remaining_candidates = accumulate(query[position+1:], filter_candidates, initial=candidates)
-    remaining_candidates = takewhile(lambda x: x, remaining_candidates)
-    longest_candidates = ((*candidates[0], i) for i, candidates in enumerate(remaining_candidates))
-    smems = unique_lastseen(longest_candidates, key=itemgetter(0))
-    return [((position-j, position+i+1), bint) for j, bint, i in smems]
-
 def finalize_smem_candidates(forward_search, query, position, candidates):
     def filter_candidates(candidates, c):
-        extended = (forward_search(em, c) for em in candidates)
+        extended=map(partial(forward_search, c=c), candidates)
         return [em for em in extended if em.bint.length]
-    candidates = list(reversed(candidates))
-    print("#", candidates)
     remaining_candidates = accumulate(query[position+1:], filter_candidates, initial=candidates)
     remaining_candidates = takewhile(lambda x: x, remaining_candidates)
-    longest_candidates = list(map(itemgetter(0), remaining_candidates))
+    longest_candidates = map(itemgetter(-1), remaining_candidates)
     return unique_lastseen(longest_candidates, key=lambda em: em.start)
-# return [((position-j, position+i+1), bint) for j, bint, i in smems]
 
-def get_smems(lr, forward, query, position):
-    candidates = list(find_smem_candidates(lr, query, position))
-    print(candidates)
+def get_smems(LF, forward, query, position):
+    candidates = list(find_smem_candidates(LF, query, position))
     return finalize_smem_candidates(forward, query, position, candidates)
 
 def find_all_smems(backward, forward, query):
     find_smems = partial(get_smems, backward, forward,  query)
     i = 0
     all_smems = []
-    while i<len(query):
+    while i < len(query):
         smems = list(find_smems(i))
-        i = max(em.end for em in smems)
+        i = smems[-1].end  # max(em.end for em in smems)
         all_smems.extend(smems)
     return all_smems
 
+def get_smem_finder(LF_map):
+    backward_search=partial(_backward_search, LF)
+    forward_ext = partial(forward_extend, LF)
+    forward_search=partial(_forward_search, forward_ext)
+    return partial(find_all_smems, backward_search, forward_search)
+
+def translate_bint(sa, bint):
+    return sa[bint.start:bint.start+bint.length]
+
+def plot_em_matches(ref, query, sa, em):
+    ref_starts = translate_bint(sa, em.bint)
+    for j, c in enumerate(ref):
+        plt.text(j, 1, c, ha="center", va="center")
+    for j, c in enumerate(query):
+        plt.text(j, -1, c, ha="center", va="center")
+    L = em.end-em.start
+    plt.hlines(range(2, 2+len(ref_starts)), ref_starts, [s+L for s in ref_starts])
+    plt.hlines(-2, em.start, em.end)
+    plt.xlim(0, len(ref)+1)
+    plt.show()
+
 reference = "ATCGTTGTGC"
 whole_sequence = reference+"$"+ reverse_compliment(reference)+"$"
-
-bwt = get_bwt(whole_sequence)
-occ = get_occ(bwt)
-C = get_C(whole_sequence)
-
-lr=partial(lr_map, occ, C)
-forward_ext = partial(forward, lr)
-backward_search=partial(_backward_search, lr)
-forward_search=partial(_forward_search, forward_ext)
-
-#smems = find_all_smems(lr, forward_ext, "ATCGTGGTGC")
-#print(list(get_smems(backward_search, forward_search, "ATCGTGGTGC", 6)))
-smems = find_all_smems(backward_search, forward_search, "ATCGTGGTGC")
+fm_index = get_fm_index(whole_sequence)
+LF=get_LF_map(fm_index) # partial(LF_map, fm_index.occ, C)
+smem_finder = get_smem_finder(LF_map)
+#
+#forward_ext = partial(forward, LF)
+#backward_search=partial(_backward_search, LF)
+#forward_search=partial(_forward_search, forward_ext)
+#
+##smems = find_all_smems(LF, forward_ext, "ATCGTGGTGC")
+##print(list(get_smems(backward_search, forward_search, "ATCGTGGTGC", 6)))
+query = "ATCGTGGTGC"
+smems = smem_finder(query)
 suffixes = list(sorted(get_suffixes(whole_sequence)))
 def plot_em(em):
     plot_bint(suffixes, em.bint, em.end-em.start)
 for em in smems:
-    plot_em(em)
+    plot_em_matches(whole_sequence, query, fm_index.sa, em)
+    # plot_em(em)
